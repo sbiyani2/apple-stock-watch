@@ -1,3 +1,4 @@
+import json
 import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -12,6 +13,8 @@ PART_NUMBERS = ["MK2E4QN/A", "MK2D4QN/A"]
 SENDER_EMAIL = os.environ["SENDER_EMAIL"]
 SENDER_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]  # Gmail App Password, set as a secret
 RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL", SENDER_EMAIL)
+
+STATE_FILE = os.environ.get("STATE_FILE", "state.json")  # "part|store" keys already alerted on
 
 FULFILLMENT_URL = "https://www.apple.com/uk/shop/pickup-message-recommendations"
 
@@ -38,10 +41,20 @@ def send_email_alert(part_number, available):
         server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
         server.quit()
         print("Alert email sent successfully!")
+        return True
     except Exception as e:
         print(f"Failed to send email: {e}")
+        return False
 
-def check_stock(postcode, part_number):
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return set(json.load(f))
+    except (OSError, ValueError):
+        return set()
+
+def check_stock(postcode, part_number, alerted):
+    """Alert on stores newly in stock. Returns the "part|store" keys to remember, or None on error."""
     params = {
         "mts.0": "regular",
         "parts.0": part_number,
@@ -57,6 +70,7 @@ def check_stock(postcode, part_number):
         stores = data.get("body", {}).get("PickupMessage", {}).get("stores", [])
         
         available = []
+        in_stock = set()
         for store in stores:
             store_name = store.get("storeName")
             parts_availability = store.get("partsAvailability", {}).get(part_number, {})
@@ -65,15 +79,29 @@ def check_stock(postcode, part_number):
             
             if pickup_display == "available":
                 print(f"[+] {part_number} STOCK AVAILABLE at {store_name}!")
-                available.append((store_name, pickup_search_quote))
+                key = f"{part_number}|{store_name}"
+                if key in alerted:
+                    in_stock.add(key)
+                else:
+                    available.append((store_name, pickup_search_quote))
 
-        if available:
-            send_email_alert(part_number, available)
+        # Only remember stores we actually alerted on, so a failed email is retried next run
+        if available and send_email_alert(part_number, available):
+            in_stock.update(f"{part_number}|{name}" for name, _ in available)
+        return in_stock
 
     except Exception as e:
         print(f"[!] Error checking stock for {part_number} near {postcode}: {e}")
+        return None
 
 if __name__ == "__main__":
+    alerted = load_state()
+    new_state = set()
     for postcode in POSTCODES:
         for part_number in PART_NUMBERS:
-            check_stock(postcode, part_number)
+            result = check_stock(postcode, part_number, alerted)
+            if result is None:  # request failed: keep what we knew about this part
+                result = {k for k in alerted if k.startswith(f"{part_number}|")}
+            new_state |= result
+    with open(STATE_FILE, "w") as f:
+        json.dump(sorted(new_state), f)
